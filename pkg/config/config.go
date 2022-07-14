@@ -17,25 +17,28 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"path"
+	"strings"
 
 	"github.com/ossf/allstar/pkg/config/operator"
 
-	"github.com/google/go-github/v39/github"
+	jsonpatch "github.com/evanphx/json-patch"
+	"github.com/google/go-github/v43/github"
 	"github.com/rs/zerolog/log"
-	"gopkg.in/yaml.v2"
+	"sigs.k8s.io/yaml"
 )
 
 // OrgConfig is the org-level config definition for Allstar
 type OrgConfig struct {
 	// OptConfig contains the opt in/out configuration.
-	OptConfig OrgOptConfig `yaml:"optConfig"`
+	OptConfig OrgOptConfig `json:"optConfig"`
 
 	// IssueLabel is the label used to tag, search, and identify GitHub Issues
 	// created by the bot. The defeault is specified by the operator of Allstar,
 	// currently: "allstar"
-	IssueLabel string `yaml:"issueLabel"`
+	IssueLabel string `json:"issueLabel"`
 
 	// IssueRepo is the name of a repository in the organization to create issues
 	// in. If left unset, by default Allstar will create issues in the repository
@@ -49,7 +52,7 @@ type OrgConfig struct {
 	//
 	// Note: When changing this setting, Allstar does not clean up previously
 	// created issues from a previous setting.
-	IssueRepo string `yaml:"issueRepo"`
+	IssueRepo string `json:"issueRepo"`
 
 	// IssueFooter is a custom message to add to the end of all Allstar created
 	// issues in the GitHub organization. It does not supercede the bot-level
@@ -57,100 +60,82 @@ type OrgConfig struct {
 	// one. This setting is useful to direct users to the organization-level
 	// config repository or documentation describing your Allstar settings and
 	// policies.
-	IssueFooter string `yaml:"issueFooter"`
+	IssueFooter string `json:"issueFooter"`
 }
 
 // OrgOptConfig is used in Allstar and policy-secific org-level config to
 // define the opt in/out configuration.
 type OrgOptConfig struct {
 	// OptOutStrategy : set to true to change from opt-in to opt-out.
-	OptOutStrategy bool `yaml:"optOutStrategy"`
+	OptOutStrategy bool `json:"optOutStrategy"`
 
 	// OptInRepos is the list of repos to opt-in when in opt-in strategy.
-	OptInRepos []string `yaml:"optInRepos"`
+	OptInRepos []string `json:"optInRepos"`
 
 	// OptOutRepos is the list of repos to opt-out when in opt-out strategy.
-	OptOutRepos []string `yaml:"optOutRepos"`
+	OptOutRepos []string `json:"optOutRepos"`
 
 	// OptOutPrivateRepos : set to true to not access private repos.
-	OptOutPrivateRepos bool `yaml:"optOutPrivateRepos"`
+	OptOutPrivateRepos bool `json:"optOutPrivateRepos"`
 
 	// OptOutPublicRepos : set to true to not access public repos.
-	OptOutPublicRepos bool `yaml:"optOutPublicRepos"`
+	OptOutPublicRepos bool `json:"optOutPublicRepos"`
+
+	// OptOutArchivedRepos : set to true to opt-out archived repositories.
+	OptOutArchivedRepos bool `json:"optOutArchivedRepos"`
 
 	// DisableRepoOverride : set to true to disallow repos from opt-in/out in
 	// their config.
-	DisableRepoOverride bool `yaml:"disableRepoOverride"`
+	DisableRepoOverride bool `json:"disableRepoOverride"`
 }
 
 // RepoConfig is the repo-level config definition for Allstar
 type RepoConfig struct {
 	// OptConfig contains the opt in/out configuration.
-	OptConfig RepoOptConfig `yaml:"optConfig"`
+	OptConfig RepoOptConfig `json:"optConfig"`
 
 	// IssueLabel is the label used to tag, search, and identify GitHub Issues
 	// created by the bot. Repo-level label my override Org-level setting
 	// regardless of Optconfig.DisableRepoOverride.
-	IssueLabel string `yaml:"issueLabel"`
+	IssueLabel string `json:"issueLabel"`
 }
 
 // RepoOptConfig is used in Allstar and policy-specific repo-level config to
 // opt in/out of enforcement.
 type RepoOptConfig struct {
 	// OptIn : set to true to opt-in this repo when in opt-in strategy
-	OptIn bool `yaml:"optIn"`
+	OptIn bool `json:"optIn"`
 
 	// OptOut: set to true to opt-out this repo when in opt-out strategy
-	OptOut bool `yaml:"optOut"`
+	OptOut bool `json:"optOut"`
 }
 
 const githubConfRepo = ".github"
 
-// FetchConfig grabs a yaml config file from github and writes it to out.
-func FetchConfig(ctx context.Context, c *github.Client, owner, repo, name string, orgLevel bool, out interface{}) error {
-	return fetchConfig(ctx, c.Repositories, owner, repo, name, orgLevel, out)
-}
+// ConfigLevel is an enum to indicate which level config to retrieve for the
+// particular policy.
+type ConfigLevel int8
 
-func fetchConfig(ctx context.Context, r repositories, owner, repoIn, name string, orgLevel bool, out interface{}) error {
-	var repo string
-	var p string
-	if orgLevel {
-		_, rsp, err := r.Get(ctx, owner, operator.OrgConfigRepo)
-		if err == nil {
-			repo = operator.OrgConfigRepo
-			p = name
-		} else if rsp != nil && rsp.StatusCode == http.StatusNotFound {
-			repo = githubConfRepo
-			p = path.Join(operator.OrgConfigDir, name)
-		} else {
-			return err
-		}
-	} else {
-		repo = repoIn
-		p = path.Join(operator.RepoConfigDir, name)
-	}
-	cf, _, rsp, err := r.GetContents(ctx, owner, repo, p, nil)
-	if err != nil {
-		if rsp != nil && rsp.StatusCode == http.StatusNotFound {
-			return nil
-		}
-		return err
-	}
-	con, err := cf.GetContent()
-	if err != nil {
-		return err
-	}
-	if err := yaml.UnmarshalStrict([]byte(con), out); err != nil {
-		log.Warn().
-			Str("org", owner).
-			Str("repo", repo).
-			Str("file", p).
-			Err(err).
-			Msg("Malformed config file, using defaults.")
-		// TODO: if UnmarshalStrict errors, does it still fill out the found fields?
-		return nil
-	}
-	return nil
+const (
+	// OrgLevel is the organization level config that is defined in the .allstar
+	// or .github config repo.
+	OrgLevel ConfigLevel = iota
+
+	// OrgRepoLevel is the repo level config that is defined in the .allstar or
+	// .github config repo.
+	OrgRepoLevel
+
+	// RepoLevel is the repo level config that is defined in the .allstar folder
+	// of the repo being checked.
+	RepoLevel
+)
+
+var walkGC func(context.Context, repositories, string, string, string,
+	*github.RepositoryContentGetOptions) (*github.RepositoryContent,
+	[]*github.RepositoryContent, *github.Response, error)
+
+func init() {
+	walkGC = walkGetContents
 }
 
 type repositories interface {
@@ -161,13 +146,128 @@ type repositories interface {
 		[]*github.RepositoryContent, *github.Response, error)
 }
 
-// IsEnabled determines if a repo is enabled by interpreting the provided
-// org-level and repo-level OptConfigs.
-func IsEnabled(ctx context.Context, o OrgOptConfig, r RepoOptConfig, c *github.Client, owner, repo string) (bool, error) {
-	return isEnabled(ctx, o, r, c.Repositories, owner, repo)
+// FetchConfig grabs a yaml config file from github and writes it to out.
+func FetchConfig(ctx context.Context, c *github.Client, owner, repo, name string, cl ConfigLevel, out interface{}) error {
+	return fetchConfig(ctx, c.Repositories, owner, repo, name, cl, out)
 }
 
-func isEnabled(ctx context.Context, o OrgOptConfig, r RepoOptConfig, rep repositories, owner, repo string) (bool, error) {
+func fetchConfig(ctx context.Context, r repositories, owner, repoIn, name string, cl ConfigLevel, out interface{}) error {
+	il, err := getInstLoc(ctx, r, owner)
+	if err != nil {
+		return err
+	}
+	var repo string
+	var p string
+	switch cl {
+	case OrgLevel:
+		if !il.Exists {
+			return nil
+		}
+		repo = il.Repo
+		p = path.Join(il.Path, name)
+	case OrgRepoLevel:
+		if !il.Exists {
+			return nil
+		}
+		repo = il.Repo
+		p = path.Join(il.Path, repoIn, name)
+	case RepoLevel:
+		repo = repoIn
+		p = path.Join(operator.RepoConfigDir, name)
+	}
+	cf, _, rsp, err := walkGC(ctx, r, owner, repo, p, nil)
+	if err != nil {
+		if rsp != nil && rsp.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return err
+	}
+	con, err := cf.GetContent()
+	if err != nil {
+		return err
+	}
+	conJSON, err := yaml.YAMLToJSON([]byte(con))
+	if err != nil {
+		return err
+	}
+	if cl == OrgLevel {
+		mergedJSON, err := checkAndMergeBase(ctx, r, p, conJSON)
+		if err != nil {
+			return err
+		}
+		conJSON = mergedJSON
+	}
+	if err := json.Unmarshal(conJSON, out); err != nil {
+		log.Warn().
+			Str("org", owner).
+			Str("repo", repo).
+			Str("file", p).
+			Err(err).
+			Msg("Malformed config file, using defaults.")
+		return nil
+	}
+	return nil
+}
+
+type anyWithBase struct {
+	BaseConfig *string `json:"baseConfig"`
+}
+
+// checkAndMergeBase checks the contents for a field "baseConfig". If found
+// reads that as "org/repo" then pulls the same path from there and uses it as
+// a base config to merge this contents on top of. Returns JSON.
+func checkAndMergeBase(ctx context.Context, r repositories, path string, contents []byte) ([]byte, error) {
+	var b anyWithBase
+	if err := json.Unmarshal(contents, &b); err != nil {
+		return nil, err
+	}
+	if b.BaseConfig == nil {
+		return contents, nil
+	}
+	sp := strings.Split(*b.BaseConfig, "/")
+	if len(sp) != 2 {
+		log.Warn().
+			Str("file", path).
+			Str("baseConfig", *b.BaseConfig).
+			Msg("Expect baseConfig to be a GitHub \"owner/repo\", ignoring.")
+		return contents, nil
+	}
+	cf, _, rsp, err := r.GetContents(ctx, sp[0], sp[1], path, nil)
+	if err != nil {
+		if rsp != nil && rsp.StatusCode == http.StatusNotFound {
+			log.Warn().
+				Str("file", path).
+				Str("baseConfig", *b.BaseConfig).
+				Msg("Path in specified baseConfig does not exist.")
+			return contents, nil
+		}
+		return nil, err
+	}
+	baseYAML, err := cf.GetContent()
+	if err != nil {
+		return nil, err
+	}
+	baseJSON, err := yaml.YAMLToJSON([]byte(baseYAML))
+	if err != nil {
+		return nil, err
+	}
+	if string(baseJSON) == "null" {
+		baseJSON = []byte("{}")
+	}
+	mergedJSON, err := jsonpatch.MergePatch(baseJSON, contents)
+	if err != nil {
+		return nil, err
+	}
+	return mergedJSON, nil
+}
+
+// IsEnabled determines if a repo is enabled by interpreting the provided
+// org-level, org-repo-level, and repo-level OptConfigs.
+func IsEnabled(ctx context.Context, o OrgOptConfig, orc, r RepoOptConfig, c *github.Client, owner, repo string) (bool, error) {
+	return isEnabled(ctx, o, orc, r, c.Repositories, owner, repo)
+}
+
+func isEnabled(ctx context.Context, o OrgOptConfig, orc, r RepoOptConfig, rep repositories, owner, repo string) (bool, error) {
 	var enabled bool
 
 	gr, _, err := rep.Get(ctx, owner, repo)
@@ -186,12 +286,21 @@ func isEnabled(ctx context.Context, o OrgOptConfig, r RepoOptConfig, rep reposit
 		if o.OptOutPublicRepos && !gr.GetPrivate() {
 			enabled = false
 		}
+		if o.OptOutArchivedRepos && gr.GetArchived() {
+			enabled = false
+		}
+		if orc.OptOut {
+			enabled = false
+		}
 		if !o.DisableRepoOverride && r.OptOut {
 			enabled = false
 		}
 	} else {
 		enabled = false
 		if contains(o.OptInRepos, repo) {
+			enabled = true
+		}
+		if orc.OptIn {
 			enabled = true
 		}
 		if !o.DisableRepoOverride && r.OptIn {
@@ -207,8 +316,8 @@ func IsBotEnabled(ctx context.Context, c *github.Client, owner, repo string) boo
 }
 
 func isBotEnabled(ctx context.Context, r repositories, owner, repo string) bool {
-	oc, rc := getAppConfigs(ctx, r, owner, repo)
-	enabled, err := isEnabled(ctx, oc.OptConfig, rc.OptConfig, r, owner, repo)
+	oc, orc, rc := getAppConfigs(ctx, r, owner, repo)
+	enabled, err := isEnabled(ctx, oc.OptConfig, orc.OptConfig, rc.OptConfig, r, owner, repo)
 	if err != nil {
 		log.Error().
 			Str("org", owner).
@@ -229,35 +338,46 @@ func isBotEnabled(ctx context.Context, r repositories, owner, repo string) bool 
 }
 
 // GetAppConfigs gets the Allstar configurations for both Org and Repo level.
-func GetAppConfigs(ctx context.Context, c *github.Client, owner, repo string) (*OrgConfig, *RepoConfig) {
+func GetAppConfigs(ctx context.Context, c *github.Client, owner, repo string) (*OrgConfig, *RepoConfig, *RepoConfig) {
 	return getAppConfigs(ctx, c.Repositories, owner, repo)
 }
 
-func getAppConfigs(ctx context.Context, r repositories, owner, repo string) (*OrgConfig, *RepoConfig) {
+func getAppConfigs(ctx context.Context, r repositories, owner, repo string) (*OrgConfig, *RepoConfig, *RepoConfig) {
 	// drop errors, if cfg file is not there, go with defaults
 	oc := &OrgConfig{}
-	if err := fetchConfig(ctx, r, owner, "", operator.AppConfigFile, true, oc); err != nil {
+	if err := fetchConfig(ctx, r, owner, "", operator.AppConfigFile, OrgLevel, oc); err != nil {
 		log.Error().
 			Str("org", owner).
 			Str("repo", repo).
-			Bool("orgLevel", true).
+			Str("configLevel", "orgLevel").
+			Str("area", "bot").
+			Str("file", operator.AppConfigFile).
+			Err(err).
+			Msg("Unexpected config error, using defaults.")
+	}
+	orc := &RepoConfig{}
+	if err := fetchConfig(ctx, r, owner, repo, operator.AppConfigFile, OrgRepoLevel, orc); err != nil {
+		log.Error().
+			Str("org", owner).
+			Str("repo", repo).
+			Str("configLevel", "orgRepoLevel").
 			Str("area", "bot").
 			Str("file", operator.AppConfigFile).
 			Err(err).
 			Msg("Unexpected config error, using defaults.")
 	}
 	rc := &RepoConfig{}
-	if err := fetchConfig(ctx, r, owner, repo, operator.AppConfigFile, false, rc); err != nil {
+	if err := fetchConfig(ctx, r, owner, repo, operator.AppConfigFile, RepoLevel, rc); err != nil {
 		log.Error().
 			Str("org", owner).
 			Str("repo", repo).
-			Bool("orgLevel", false).
+			Str("configLevel", "repoLevel").
 			Str("area", "bot").
 			Str("file", operator.AppConfigFile).
 			Err(err).
 			Msg("Unexpected config error, using defaults.")
 	}
-	return oc, rc
+	return oc, orc, rc
 }
 
 func contains(s []string, e string) bool {

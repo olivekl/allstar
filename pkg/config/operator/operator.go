@@ -19,6 +19,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // AppID should be set to the application ID of the created GitHub App. See:
@@ -26,6 +28,10 @@ import (
 const setAppID = 119816
 
 var AppID int64
+
+// Raw value of the private key for the App. See:
+// https://docs.github.com/en/developers/apps/building-github-apps/authenticating-with-github-apps#generating-a-private-key
+var PrivateKey string
 
 // KeySecret should be set to the name of a secret containing a private key for
 // the App. See:
@@ -49,6 +55,25 @@ const RepoConfigDir = ".allstar"
 // AppConfigFile is the name of the expected file in org or repo level config.
 const AppConfigFile = "allstar.yaml"
 
+// DoNothingOnOptOut is a configuration flag indicating if allstar should do
+// nothing and skip the corresponding checks when a repository is opted out.
+// Can be configured with environment variable DO_NOTHING_ON_OPT_OUT, where
+// the value should be a string equivalent of a bool, as accepted by
+// strconv.ParseBool.
+const setDoNothingOnOptOut = false
+
+var DoNothingOnOptOut bool
+
+// LogLevel is a configuration flag indicating the minimum logging level that
+// allstar should use when emitting logs. Can be configured with the environment
+// variable ALLSTAR_LOG_LEVEL, which must be one of the following strings:
+// panic ; fatal ; error ; warn ; info ; debug ; trace
+// If an unparsable string is provided, then allstar will automatically default
+// to info level.
+const setLogLevel = zerolog.InfoLevel
+
+var LogLevel zerolog.Level
+
 // GitHubIssueLabel is the label used to tag, search, and identify GitHub
 // Issues created by the bot.
 const GitHubIssueLabel = "allstar"
@@ -58,9 +83,11 @@ const GitHubIssueFooter = `This issue will auto resolve when the policy is in co
 
 Issue created by Allstar. See https://github.com/ossf/allstar/ for more information. For questions specific to the repository, please contact the owner or maintainer.`
 
-// NoticePingDuration is the duration to wait between pinging notice actions,
+// NoticePingDuration is the duration (in hours) to wait between pinging notice actions,
 // such as updating a GitHub issue.
-const NoticePingDuration = (24 * time.Hour)
+const setNoticePingDurationHrs = (24 * time.Hour)
+
+var NoticePingDuration time.Duration
 
 var osGetenv func(string) string
 
@@ -78,10 +105,37 @@ func setVars() {
 		AppID = setAppID
 	}
 
+	PrivateKey = osGetenv("PRIVATE_KEY")
+
 	keySecret := osGetenv("KEY_SECRET")
 	if keySecret != "" {
 		KeySecret = keySecret
 	} else {
 		KeySecret = setKeySecret
+	}
+
+	doNothingOnOptOutStr := osGetenv("DO_NOTHING_ON_OPT_OUT")
+	doNothingOnOptOut, err := strconv.ParseBool(doNothingOnOptOutStr)
+	if err == nil {
+		DoNothingOnOptOut = doNothingOnOptOut
+	} else {
+		DoNothingOnOptOut = setDoNothingOnOptOut
+	}
+
+	logLevelStr := osGetenv("ALLSTAR_LOG_LEVEL")
+	logLevel, err := zerolog.ParseLevel(logLevelStr)
+	if err != nil || logLevel == zerolog.NoLevel {
+		LogLevel = setLogLevel
+	} else {
+		LogLevel = logLevel
+	}
+	zerolog.SetGlobalLevel(LogLevel)
+
+	noticePingDurationRaw := osGetenv("NOTICE_PING_DURATION_HOURS")
+	noticePingDuration, err := strconv.ParseInt(noticePingDurationRaw, 10, 64)
+	if err == nil {
+		NoticePingDuration = (time.Duration(noticePingDuration) * time.Hour)
+	} else {
+		NoticePingDuration = setNoticePingDurationHrs
 	}
 }

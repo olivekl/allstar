@@ -20,11 +20,14 @@ import (
 	"fmt"
 
 	"github.com/ossf/allstar/pkg/config"
+	"github.com/ossf/allstar/pkg/config/operator"
 	"github.com/ossf/allstar/pkg/policydef"
 
-	"github.com/google/go-github/v39/github"
+	"github.com/google/go-github/v43/github"
 	"github.com/rs/zerolog/log"
 )
+
+var doNothingOnOptOut = operator.DoNothingOnOptOut
 
 const configFile = "outside.yaml"
 const polName = "Outside Collaborators"
@@ -57,41 +60,41 @@ Alternately, if this repository does not have any maintainers, archive or delete
 type OrgConfig struct {
 	// OptConfig is the standard org-level opt in/out config, RepoOverride
 	// applies to all config.
-	OptConfig config.OrgOptConfig `yaml:"optConfig"`
+	OptConfig config.OrgOptConfig `json:"optConfig"`
 
 	// Action defines which action to take, default log, other: issue...
-	Action string `yaml:"action"`
+	Action string `json:"action"`
 
 	// PushAllowed defined if outside collaboraters are allowed to have push
 	// access, default true.
-	PushAllowed bool `yaml:"pushAllowed"`
+	PushAllowed bool `json:"pushAllowed"`
 
 	// AdminAllowed defined if outside collaboraters are allowed to have admin
 	// access, default false.
-	AdminAllowed bool `yaml:"adminAllowed"`
+	AdminAllowed bool `json:"adminAllowed"`
 
 	// TestingOwnerlessAllowed defined if repositories are allowed to have no
 	// administrators, default false.
-	TestingOwnerlessAllowed bool `yaml:"testingOwnerlessAllowed"`
+	TestingOwnerlessAllowed bool `json:"testingOwnerlessAllowed"`
 }
 
 // RepoConfig is the repo-level config for Outside Collaborators security
 // policy.
 type RepoConfig struct {
 	// OptConfig is the standard repo-level opt in/out config.
-	OptConfig config.RepoOptConfig `yaml:"optConfig"`
+	OptConfig config.RepoOptConfig `json:"optConfig"`
 
 	// Action overrides the same setting in org-level, only if present.
-	Action *string `yaml:"action"`
+	Action *string `json:"action"`
 
 	// PushAllowed overrides the same setting in org-level, only if present.
-	PushAllowed *bool `yaml:"pushAllowed"`
+	PushAllowed *bool `json:"pushAllowed"`
 
 	// AdminAllowed overrides the same setting in org-level, only if present.
-	AdminAllowed *bool `yaml:"adminAllowed"`
+	AdminAllowed *bool `json:"adminAllowed"`
 
 	// TestingOwnerlessAllowed overrides the same setting in org-level, only if present.
-	TestingOwnerlessAllowed *bool `yaml:"testingOwnerlessAllowed"`
+	TestingOwnerlessAllowed *bool `json:"testingOwnerlessAllowed"`
 }
 
 type mergedConfig struct {
@@ -111,9 +114,9 @@ type details struct {
 	TeamAdmins        []string
 }
 
-var configFetchConfig func(context.Context, *github.Client, string, string, string, bool, interface{}) error
+var configFetchConfig func(context.Context, *github.Client, string, string, string, config.ConfigLevel, interface{}) error
 
-var configIsEnabled func(ctx context.Context, o config.OrgOptConfig, r config.RepoOptConfig, c *github.Client, owner, repo string) (bool, error)
+var configIsEnabled func(ctx context.Context, o config.OrgOptConfig, orc, r config.RepoOptConfig, c *github.Client, owner, repo string) (bool, error)
 
 func init() {
 	configFetchConfig = config.FetchConfig
@@ -150,8 +153,8 @@ func (o Outside) Check(ctx context.Context, c *github.Client, owner,
 
 func check(ctx context.Context, rep repositories, c *github.Client, owner,
 	repo string) (*policydef.Result, error) {
-	oc, rc := getConfig(ctx, c, owner, repo)
-	enabled, err := configIsEnabled(ctx, oc.OptConfig, rc.OptConfig, c, owner, repo)
+	oc, orc, rc := getConfig(ctx, c, owner, repo)
+	enabled, err := configIsEnabled(ctx, oc.OptConfig, orc.OptConfig, rc.OptConfig, c, owner, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +164,19 @@ func check(ctx context.Context, rep repositories, c *github.Client, owner,
 		Str("area", polName).
 		Bool("enabled", enabled).
 		Msg("Check repo enabled")
-	mc := mergeConfig(oc, rc, repo)
+	if !enabled && doNothingOnOptOut {
+		// Don't run this policy if disabled and requested by operator. This is
+		// only checking enablement of policy, but not Allstar overall, this is
+		// ok for now.
+		return &policydef.Result{
+			Enabled:    enabled,
+			Pass:       true,
+			NotifyText: "Disabled",
+			Details:    details{},
+		}, nil
+	}
+
+	mc := mergeConfig(oc, orc, rc, repo)
 
 	var d details
 	outAdmins, err := getUsers(ctx, rep, owner, repo, "admin", "outside")
@@ -299,62 +314,79 @@ func (o Outside) Fix(ctx context.Context, c *github.Client, owner, repo string) 
 // configuration stored in the org-level repo, default log. Implementing
 // policydef.Policy.GetAction()
 func (o Outside) GetAction(ctx context.Context, c *github.Client, owner, repo string) string {
-	oc, rc := getConfig(ctx, c, owner, repo)
-	mc := mergeConfig(oc, rc, repo)
+	oc, orc, rc := getConfig(ctx, c, owner, repo)
+	mc := mergeConfig(oc, orc, rc, repo)
 	return mc.Action
 }
 
-func getConfig(ctx context.Context, c *github.Client, owner, repo string) (*OrgConfig, *RepoConfig) {
+func getConfig(ctx context.Context, c *github.Client, owner, repo string) (*OrgConfig, *RepoConfig, *RepoConfig) {
 	oc := &OrgConfig{ // Fill out non-zero defaults
 		Action:                  "log",
 		PushAllowed:             true,
 		TestingOwnerlessAllowed: true,
 	}
-	if err := configFetchConfig(ctx, c, owner, "", configFile, true, oc); err != nil {
+	if err := configFetchConfig(ctx, c, owner, "", configFile, config.OrgLevel, oc); err != nil {
 		log.Error().
 			Str("org", owner).
 			Str("repo", repo).
-			Bool("orgLevel", true).
+			Str("configLevel", "orgLevel").
+			Str("area", polName).
+			Str("file", configFile).
+			Err(err).
+			Msg("Unexpected config error, using defaults.")
+	}
+	orc := &RepoConfig{}
+	if err := configFetchConfig(ctx, c, owner, repo, configFile, config.OrgRepoLevel, orc); err != nil {
+		log.Error().
+			Str("org", owner).
+			Str("repo", repo).
+			Str("configLevel", "orgRepoLevel").
 			Str("area", polName).
 			Str("file", configFile).
 			Err(err).
 			Msg("Unexpected config error, using defaults.")
 	}
 	rc := &RepoConfig{}
-	if err := configFetchConfig(ctx, c, owner, repo, configFile, false, rc); err != nil {
+	if err := configFetchConfig(ctx, c, owner, repo, configFile, config.RepoLevel, rc); err != nil {
 		log.Error().
 			Str("org", owner).
 			Str("repo", repo).
-			Bool("orgLevel", false).
+			Str("configLevel", "repoLevel").
 			Str("area", polName).
 			Str("file", configFile).
 			Err(err).
 			Msg("Unexpected config error, using defaults.")
 	}
-	return oc, rc
+	return oc, orc, rc
 }
 
-func mergeConfig(oc *OrgConfig, rc *RepoConfig, repo string) *mergedConfig {
+func mergeConfig(oc *OrgConfig, orc *RepoConfig, rc *RepoConfig, repo string) *mergedConfig {
 	mc := &mergedConfig{
 		Action:                  oc.Action,
 		PushAllowed:             oc.PushAllowed,
 		AdminAllowed:            oc.AdminAllowed,
 		TestingOwnerlessAllowed: oc.TestingOwnerlessAllowed,
 	}
+	mc = mergeInRepoConfig(mc, orc, repo)
 
 	if !oc.OptConfig.DisableRepoOverride {
-		if rc.Action != nil {
-			mc.Action = *rc.Action
-		}
-		if rc.PushAllowed != nil {
-			mc.PushAllowed = *rc.PushAllowed
-		}
-		if rc.AdminAllowed != nil {
-			mc.AdminAllowed = *rc.AdminAllowed
-		}
-		if rc.TestingOwnerlessAllowed != nil {
-			mc.TestingOwnerlessAllowed = *rc.TestingOwnerlessAllowed
-		}
+		mc = mergeInRepoConfig(mc, rc, repo)
+	}
+	return mc
+}
+
+func mergeInRepoConfig(mc *mergedConfig, rc *RepoConfig, repo string) *mergedConfig {
+	if rc.Action != nil {
+		mc.Action = *rc.Action
+	}
+	if rc.PushAllowed != nil {
+		mc.PushAllowed = *rc.PushAllowed
+	}
+	if rc.AdminAllowed != nil {
+		mc.AdminAllowed = *rc.AdminAllowed
+	}
+	if rc.TestingOwnerlessAllowed != nil {
+		mc.TestingOwnerlessAllowed = *rc.TestingOwnerlessAllowed
 	}
 	return mc
 }

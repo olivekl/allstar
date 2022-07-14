@@ -18,12 +18,14 @@ package issue
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/ossf/allstar/pkg/config"
 	"github.com/ossf/allstar/pkg/config/operator"
+	"github.com/rs/zerolog/log"
 
-	"github.com/google/go-github/v39/github"
+	"github.com/google/go-github/v43/github"
 )
 
 const issueRepoTitle = "Security Policy violation for repository %q %v"
@@ -40,7 +42,7 @@ type issues interface {
 		*github.IssueComment, *github.Response, error)
 }
 
-var configGetAppConfigs func(context.Context, *github.Client, string, string) (*config.OrgConfig, *config.RepoConfig)
+var configGetAppConfigs func(context.Context, *github.Client, string, string) (*config.OrgConfig, *config.RepoConfig, *config.RepoConfig)
 
 func init() {
 	configGetAppConfigs = config.GetAppConfigs
@@ -91,7 +93,7 @@ func ensure(ctx context.Context, c *github.Client, issues issues, owner, repo, p
 		return err
 	}
 	if issue == nil {
-		oc, _ := configGetAppConfigs(ctx, c, owner, repo)
+		oc, _, _ := configGetAppConfigs(ctx, c, owner, repo)
 		var footer string
 		if oc.IssueFooter == "" {
 			footer = operator.GitHubIssueFooter
@@ -107,7 +109,15 @@ func ensure(ctx context.Context, c *github.Client, issues issues, owner, repo, p
 			Body:   &body,
 			Labels: &[]string{label},
 		}
-		_, _, err := issues.Create(ctx, owner, issueRepo, new)
+		_, rsp, err := issues.Create(ctx, owner, issueRepo, new)
+		if err != nil && rsp != nil && (rsp.StatusCode == http.StatusGone || rsp.StatusCode == http.StatusForbidden) {
+			log.Warn().
+				Str("org", owner).
+				Str("repo", repo).
+				Str("area", policy).
+				Msg("Action set to issue, but issues are disabled.")
+			return nil
+		}
 		return err
 	}
 	if issue.GetState() == "closed" {
@@ -115,7 +125,15 @@ func ensure(ctx context.Context, c *github.Client, issues issues, owner, repo, p
 		update := &github.IssueRequest{
 			State: &state,
 		}
-		if _, _, err := issues.Edit(ctx, owner, issueRepo, issue.GetNumber(), update); err != nil {
+		if _, rsp, err := issues.Edit(ctx, owner, issueRepo, issue.GetNumber(), update); err != nil {
+			if rsp != nil && (rsp.StatusCode == http.StatusGone || rsp.StatusCode == http.StatusForbidden) {
+				log.Warn().
+					Str("org", owner).
+					Str("repo", repo).
+					Str("area", policy).
+					Msg("Action set to issue, but issues are disabled.")
+				return nil
+			}
 			return err
 		}
 		body := "Reopening issue. Status:\n" + text
@@ -130,7 +148,15 @@ func ensure(ctx context.Context, c *github.Client, issues issues, owner, repo, p
 		comment := &github.IssueComment{
 			Body: &body,
 		}
-		_, _, err := issues.CreateComment(ctx, owner, issueRepo, issue.GetNumber(), comment)
+		_, rsp, err := issues.CreateComment(ctx, owner, issueRepo, issue.GetNumber(), comment)
+		if err != nil && rsp != nil && (rsp.StatusCode == http.StatusGone || rsp.StatusCode == http.StatusForbidden) {
+			log.Warn().
+				Str("org", owner).
+				Str("repo", repo).
+				Str("area", policy).
+				Msg("Action set to issue, but issues are disabled.")
+			return nil
+		}
 		return err
 	}
 	return nil
@@ -154,7 +180,15 @@ func closeIssue(ctx context.Context, c *github.Client, issues issues, owner, rep
 		comment := &github.IssueComment{
 			Body: &body,
 		}
-		if _, _, err := issues.CreateComment(ctx, owner, issueRepo, issue.GetNumber(), comment); err != nil {
+		if _, rsp, err := issues.CreateComment(ctx, owner, issueRepo, issue.GetNumber(), comment); err != nil {
+			if rsp != nil && (rsp.StatusCode == http.StatusGone || rsp.StatusCode == http.StatusForbidden) {
+				log.Warn().
+					Str("org", owner).
+					Str("repo", repo).
+					Str("area", policy).
+					Msg("Action set to issue, but issues are disabled.")
+				return nil
+			}
 			return err
 		}
 		state := "closed"
@@ -170,9 +204,12 @@ func closeIssue(ctx context.Context, c *github.Client, issues issues, owner, rep
 
 func getIssueLabel(ctx context.Context, c *github.Client, owner, repo string) string {
 	label := operator.GitHubIssueLabel
-	oc, rc := configGetAppConfigs(ctx, c, owner, repo)
+	oc, orc, rc := configGetAppConfigs(ctx, c, owner, repo)
 	if len(oc.IssueLabel) > 0 {
 		label = oc.IssueLabel
+	}
+	if len(orc.IssueLabel) > 0 {
+		label = orc.IssueLabel
 	}
 	if len(rc.IssueLabel) > 0 {
 		label = rc.IssueLabel
@@ -181,7 +218,7 @@ func getIssueLabel(ctx context.Context, c *github.Client, owner, repo string) st
 }
 
 func getIssueRepoTitle(ctx context.Context, c *github.Client, owner, repo, policy string) (string, string) {
-	oc, _ := configGetAppConfigs(ctx, c, owner, repo)
+	oc, _, _ := configGetAppConfigs(ctx, c, owner, repo)
 	if len(oc.IssueRepo) > 0 {
 		return oc.IssueRepo, fmt.Sprintf(issueRepoTitle, repo, policy)
 	}

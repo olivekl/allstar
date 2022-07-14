@@ -1,4 +1,4 @@
-// Copyright 2021 Allstar Authors
+// Copyright 2022 Allstar Authors
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package security implements the SECURITY.md security policy.
-package security
+// Package workflow implements the Dangerous Workflow security policy check
+// from scorecard.
+package workflow
 
 import (
 	"context"
@@ -22,36 +23,30 @@ import (
 	"github.com/ossf/allstar/pkg/config"
 	"github.com/ossf/allstar/pkg/config/operator"
 	"github.com/ossf/allstar/pkg/policydef"
+	"github.com/ossf/allstar/pkg/scorecard"
+	"github.com/ossf/scorecard/v4/checker"
+	"github.com/ossf/scorecard/v4/checks"
 
 	"github.com/google/go-github/v43/github"
 	"github.com/rs/zerolog/log"
-	"github.com/shurcooL/githubv4"
 )
 
 var doNothingOnOptOut = operator.DoNothingOnOptOut
 
-const configFile = "security.yaml"
-const polName = "SECURITY.md"
+const configFile = "dangerous_workflow.yaml"
+const polName = "Dangerous Workflow"
 
-const notifyText = `A SECURITY.md file can give users information about what constitutes a vulnerability and how to report one securely so that information about a bug is not publicly visible. Examples of secure reporting methods include using an issue tracker with private issue support, or encrypted email with a published key.
-
-To fix this, add a SECURITY.md file that explains how to handle vulnerabilities found in your repository. Go to https://github.com/%v/%v/security/policy to enable.
-
-For more information, see https://docs.github.com/en/code-security/getting-started/adding-a-security-policy-to-your-repository.`
-
-// OrgConfig is the org-level config definition for Branch Protection.
+// OrgConfig is the org-level config definition for this policy.
 type OrgConfig struct {
 	// OptConfig is the standard org-level opt in/out config, RepoOverride applies to all
-	// BP config.
+	// config.
 	OptConfig config.OrgOptConfig `json:"optConfig"`
 
 	// Action defines which action to take, default log, other: issue...
 	Action string `json:"action"`
-
-	//TODO add default contents for "fix" action
 }
 
-// RepoConfig is the repo-level config for Branch Protection
+// RepoConfig is the repo-level config for this policy.
 type RepoConfig struct {
 	// OptConfig is the standard repo-level opt in/out config.
 	OptConfig config.RepoOptConfig `json:"optConfig"`
@@ -65,49 +60,36 @@ type mergedConfig struct {
 }
 
 type details struct {
-	Enabled bool
-	URL     string
+	Findings []string
 }
 
 var configFetchConfig func(context.Context, *github.Client, string, string, string, config.ConfigLevel, interface{}) error
 
-var configIsEnabled func(ctx context.Context, o config.OrgOptConfig, orc, r config.RepoOptConfig, c *github.Client, owner, repo string) (bool, error)
-
 func init() {
 	configFetchConfig = config.FetchConfig
-	configIsEnabled = config.IsEnabled
 }
 
-type v4client interface {
-	Query(context.Context, interface{}, map[string]interface{}) error
-}
+// Workflow is the Dangerous Workflow policy object, implements
+// policydef.Policy.
+type Workflow bool
 
-// Security is the SECURITY.md policy object, implements policydef.Policy.
-type Security bool
-
-// NewSecurity returns a new SECURITY.md policy.
-func NewSecurity() policydef.Policy {
-	var s Security
-	return s
+// NewWorkflow returns a new Dangerous Workflow policy.
+func NewWorkflow() policydef.Policy {
+	var b Workflow
+	return b
 }
 
 // Name returns the name of this policy, implementing policydef.Policy.Name()
-func (s Security) Name() string {
+func (b Workflow) Name() string {
 	return polName
 }
 
-// Check performs the polcy check for SECURITY.md policy based on the
+// Check performs the policy check for this policy based on the
 // configuration stored in the org/repo, implementing policydef.Policy.Check()
-func (s Security) Check(ctx context.Context, c *github.Client, owner,
-	repo string) (*policydef.Result, error) {
-	v4c := githubv4.NewClient(c.Client())
-	return check(ctx, c, v4c, owner, repo)
-}
-
-func check(ctx context.Context, c *github.Client, v4c v4client, owner,
+func (b Workflow) Check(ctx context.Context, c *github.Client, owner,
 	repo string) (*policydef.Result, error) {
 	oc, orc, rc := getConfig(ctx, c, owner, repo)
-	enabled, err := configIsEnabled(ctx, oc.OptConfig, orc.OptConfig, rc.OptConfig, c, owner, repo)
+	enabled, err := config.IsEnabled(ctx, oc.OptConfig, orc.OptConfig, rc.OptConfig, c, owner, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -129,44 +111,81 @@ func check(ctx context.Context, c *github.Client, v4c v4client, owner,
 		}, nil
 	}
 
-	var q struct {
-		Repository struct {
-			SecurityPolicyUrl       string
-			IsSecurityPolicyEnabled bool
-		} `graphql:"repository(owner: $owner, name: $name)"`
-	}
-	variables := map[string]interface{}{
-		"owner": githubv4.String(owner),
-		"name":  githubv4.String(repo),
-	}
-	if err := v4c.Query(ctx, &q, variables); err != nil {
+	fullName := fmt.Sprintf("%s/%s", owner, repo)
+	tr := c.Client().Transport
+	scc, err := scorecard.Get(ctx, fullName, tr)
+	if err != nil {
 		return nil, err
 	}
-	if !q.Repository.IsSecurityPolicyEnabled {
-		return &policydef.Result{
-			Enabled:    enabled,
-			Pass:       false,
-			NotifyText: "Security policy not enabled.\n" + fmt.Sprintf(notifyText, owner, repo),
-			Details: details{
-				Enabled: false,
-				URL:     q.Repository.SecurityPolicyUrl,
-			},
-		}, nil
+
+	l := checker.NewLogger()
+	cr := &checker.CheckRequest{
+		Ctx:        ctx,
+		RepoClient: scc.ScRepoClient,
+		Repo:       scc.ScRepo,
+		Dlogger:    l,
 	}
+
+	res := checks.DangerousWorkflow(cr)
+	if res.Error != nil {
+		return nil, res.Error
+	}
+
+	logs := convertLogs(l.Flush())
+	pass := res.Score >= checker.MaxResultScore
+	var notify string
+	if !pass {
+		notify = fmt.Sprintf(`Project is out of compliance with Dangerous Workflow policy: %v
+
+**Rule Description**
+Dangerous Workflows are GitHub Action workflows that exhibit dangerous patterns that could render them vulnerable to attack. A vulnerable workflow is susceptible to leaking repository secrets, or allowing an attacker write access using the GITHUB_TOKEN. For more information about the particular patterns that are detected see the [Security Scorecards Documentation](https://github.com/ossf/scorecard/blob/main/docs/checks.md#dangerous-workflow) for Dangerous Workflow.
+
+**Remediation Steps**
+Avoid the dangerous workflow patterns. See this [post](https://securitylab.github.com/research/github-actions-preventing-pwn-requests/) for information on avoiding untrusted code checkouts. See this [document](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections) for information on avoiding and mitigating the risk of script injections.
+
+
+`,
+			res.Reason)
+		if len(logs) > 10 {
+			notify += fmt.Sprintf(
+				"**First 10 Dangerous Patterns Found**\n\n%v"+
+					"- Run a Scorecards scan to see full list.\n\n",
+				listJoin(logs[:10]))
+		} else {
+			notify += fmt.Sprintf("**Dangerous Patterns Found**\n\n%v\n", listJoin(logs))
+		}
+		notify += `**Additional Information**
+This policy is drawn from [Security Scorecards](https://github.com/ossf/scorecard/), which is a tool that scores a project's adherence to security best practices. You may wish to run a Scorecards scan directly on this repository for more details.`
+	}
+
 	return &policydef.Result{
 		Enabled:    enabled,
-		Pass:       true,
-		NotifyText: "",
+		Pass:       pass,
+		NotifyText: notify,
 		Details: details{
-			Enabled: true,
-			URL:     q.Repository.SecurityPolicyUrl,
+			Findings: logs,
 		},
 	}, nil
 }
 
-// Fix implementing policydef.Policy.Fix(). Currently not supported. Plan
-// to support this TODO.
-func (s Security) Fix(ctx context.Context, c *github.Client, owner, repo string) error {
+func listJoin(list []string) string {
+	var s string
+	for _, l := range list {
+		s += fmt.Sprintf("- %v\n", l)
+	}
+	return s
+}
+
+func convertLogs(logs []checker.CheckDetail) []string {
+	var s []string
+	for _, l := range logs {
+		s = append(s, fmt.Sprintf("%v[%v]:%v", l.Msg.Path, l.Msg.Offset, l.Msg.Text))
+	}
+	return s
+}
+
+// Fix implementing policydef.Policy.Fix(). Scorecard checks will not have a Fix option.
+func (b Workflow) Fix(ctx context.Context, c *github.Client, owner, repo string) error {
 	log.Warn().
 		Str("org", owner).
 		Str("repo", repo).
@@ -175,10 +194,10 @@ func (s Security) Fix(ctx context.Context, c *github.Client, owner, repo string)
 	return nil
 }
 
-// GetAction returns the configured action from SECURITY.md policy's
-// configuration stored in the org-level repo, default log. Implementing
+// GetAction returns the configured action from this policy's configuration
+// stored in the org-level repo, default log. Implementing
 // policydef.Policy.GetAction()
-func (s Security) GetAction(ctx context.Context, c *github.Client, owner, repo string) string {
+func (b Workflow) GetAction(ctx context.Context, c *github.Client, owner, repo string) string {
 	oc, orc, rc := getConfig(ctx, c, owner, repo)
 	mc := mergeConfig(oc, orc, rc, repo)
 	return mc.Action
@@ -192,7 +211,7 @@ func getConfig(ctx context.Context, c *github.Client, owner, repo string) (*OrgC
 		log.Error().
 			Str("org", owner).
 			Str("repo", repo).
-			Str("configLevel", "orgLevel").
+			Bool("orgLevel", true).
 			Str("area", polName).
 			Str("file", configFile).
 			Err(err).
@@ -214,7 +233,7 @@ func getConfig(ctx context.Context, c *github.Client, owner, repo string) (*OrgC
 		log.Error().
 			Str("org", owner).
 			Str("repo", repo).
-			Str("configLevel", "repoLevel").
+			Bool("orgLevel", false).
 			Str("area", polName).
 			Str("file", configFile).
 			Err(err).
@@ -223,7 +242,7 @@ func getConfig(ctx context.Context, c *github.Client, owner, repo string) (*OrgC
 	return oc, orc, rc
 }
 
-func mergeConfig(oc *OrgConfig, orc *RepoConfig, rc *RepoConfig, repo string) *mergedConfig {
+func mergeConfig(oc *OrgConfig, orc, rc *RepoConfig, repo string) *mergedConfig {
 	mc := &mergedConfig{
 		Action: oc.Action,
 	}

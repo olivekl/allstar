@@ -2,22 +2,26 @@
 
 # **Allstar**
 
-## Overview 
+## Overview
 
 -  [What Is Allstar?](#what-is-allstar)
+
+## What's new with Allstar
+
+- [whats-new.md](whats-new.md)
 
 ## Disabling Unwanted Issues
 
 -  [Help! I'm getting issues created by Allstar and I don't want them!](#disabling-unwanted-issues-1) 
 
-## Getting Started 
+## Getting Started
 
--  [Background](#background) 
--  [Org-Level Options](#org-level-options) 
+-  [Background](#background)
+-  [Org-Level Options](#org-level-options)
 -  [Installation Options](#installation-options)
     - [Quickstart Installation](#quickstart-installation)
     - [Manual Installation](#manual-installation)
- 
+
 ## Policies and Actions
 - [Actions](#actions)
 - [Policies](#policies)
@@ -32,21 +36,27 @@
 ________
 ________
 
-## Overview 
+## Overview
 
 ### What is Allstar?
 
-Allstar is a GitHub App that continuously monitors GitHub organizations or repositories for adherence to security best practices. 
-If Allstar detects a security policy violation, it creates an issue to alert the repository or organization owner. 
-For some security policies, Allstar can also automatically change the project setting that caused the violation, reverting it to the expected state. 
+Allstar is a GitHub App that continuously monitors GitHub organizations or
+repositories for adherence to security best practices.  If Allstar detects a
+security policy violation, it creates an issue to alert the repository or
+organization owner.  For some security policies, Allstar can also automatically
+change the project setting that caused the violation, reverting it to the
+expected state.
 
-Allstar’s goal is to give you finely tuned control over the files and settings that affect the security of your projects.
-You can choose which security policies to monitor at both the organization and repository level, and how to handle policy violations. 
-You can also develop or contribute new policies. 
+Allstar’s goal is to give you finely tuned control over the files and settings
+that affect the security of your projects.  You can choose which security
+policies to monitor at both the organization and repository level, and how to
+handle policy violations.  You can also develop or contribute new policies.
 
 Allstar is developed under the [OpenSSF](https://openssf.org/) organization, as
 a part of the [Securing Critical Projects Working
-Group](https://github.com/ossf/wg-securing-critical-projects). 
+Group](https://github.com/ossf/wg-securing-critical-projects).
+
+## [What's new with Allstar](whats-new.md)
 
 ## Disabling Unwanted Issues
 If you're getting unwanted issues created by Allstar, follow [these directions](opt-out.md) to opt out. 
@@ -329,6 +339,60 @@ secondary location. To clarify, for `allstar.yaml`:
 
 This is also true for the org-level configuration files for the individual
 policies, as described below.
+
+### Repo policy configurations in the Org Repo
+
+Allstar will also look for repo-level policy configurations in the
+organization's `.allstar` repository, under the directory with the same name as
+the repository. This configuration is used regardless of whether "repo override"
+is disabled.
+
+For example, Allstar will lookup the policy configuration for a given repo
+`myapp` in the following order:
+
+| Repository | Path | Condition |
+| - | - | - |
+| `myapp` | `.allstar/branch_protection.yaml` | When "repo override" is allowed. |
+| `.allstar` | `myapp/branch_protection.yaml` | All times. |
+| `.allstar` | `branch_protection.yaml` | All times. |
+| `.github` | `allstar/myapp/branch_protection.yaml` | If `.allstar` repo does not exist. |
+| `.github` | `allstar/branch_protection.yaml` | If `.allstar` repo does not exist. |
+
+### Org-level Base and Merge Configuration Location
+
+For org-level Allstar and policy configuration files, you may specify the field
+`baseConfig` to specify another repository that contains base Allstar
+configuration. This is best explained with an example.
+
+Suppose you have multiple GitHub organizations, but want to maintain a single
+Allstar configuration. Your main organization is "acme", and the repository
+`acme/.allstar` contains `allstar.yaml`:
+
+```yaml
+optConfig:
+  optOutStrategy: true
+issueLabel: allstar-acme
+issueFooter: Issue created by Acme security team.
+```
+
+You also have a satellite GitHub organization named "acme-sat". You want to
+re-use the main config, but apply some changes on top by disabling Allstar on
+certain repositories. The repository `acme-sat/.allstar` contains
+`allstar.yaml`:
+
+```yaml
+baseConfig: acme/.allstar
+optConfig:
+  optOutRepos:
+  - acmesat-one
+  - acmesat-two
+```
+
+This will use all the config from `acme/.allstar` as the base config, but then
+apply any changes in the current file on top of the base configuration. The
+method this is applied is described as a [JSON Merge
+Patch](https://datatracker.ietf.org/doc/html/rfc7396). The `baseConfig` must be
+a GitHub `<org>/<repository>`.
 
 ## **Contribute Policies**
 

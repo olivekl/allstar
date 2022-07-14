@@ -19,49 +19,62 @@ package binary
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/ossf/allstar/pkg/config"
 	"github.com/ossf/allstar/pkg/policydef"
+	"github.com/ossf/allstar/pkg/scorecard"
 	"github.com/ossf/scorecard/v4/checker"
 	"github.com/ossf/scorecard/v4/checks"
-	"github.com/ossf/scorecard/v4/clients/githubrepo"
 
-	"github.com/google/go-github/v39/github"
+	"github.com/google/go-github/v43/github"
 	"github.com/rs/zerolog/log"
 )
 
 const configFile = "binary_artifacts.yaml"
 const polName = "Binary Artifacts"
-const defaultGitRef = "HEAD"
 
 // OrgConfig is the org-level config definition for this policy.
 type OrgConfig struct {
 	// OptConfig is the standard org-level opt in/out config, RepoOverride applies to all
 	// config.
-	OptConfig config.OrgOptConfig `yaml:"optConfig"`
+	OptConfig config.OrgOptConfig `json:"optConfig"`
 
 	// Action defines which action to take, default log, other: issue...
-	Action string `yaml:"action"`
+	Action string `json:"action"`
+
+	// IgnoreFiles is a list of file names to ignore. Any Binary Artifacts found
+	// with these names are allowed, and the policy may still pass. These are
+	// just the file name, not a full path. Globs are not allowed.
+	IgnoreFiles []string `json:"ignoreFiles"`
 }
 
 // RepoConfig is the repo-level config for this policy.
 type RepoConfig struct {
 	// OptConfig is the standard repo-level opt in/out config.
-	OptConfig config.RepoOptConfig `yaml:"optConfig"`
+	OptConfig config.RepoOptConfig `json:"optConfig"`
 
 	// Action overrides the same setting in org-level, only if present.
-	Action *string `yaml:"action"`
+	Action *string `json:"action"`
+
+	// IgnorePaths is a list of full paths to ignore. If these are reported as a
+	// Binary Artifact, they will be ignored and the policy may still pass. These
+	// must be full paths with directories. Globs are not allowed. These are
+	// allowed even if RepoOverride is false.
+	IgnorePaths []string `json:"ignorePaths"`
 }
 
 type mergedConfig struct {
-	Action string
+	Action      string
+	IgnoreFiles []string
+	IgnorePaths []string
 }
 
 type details struct {
 	Artifacts []string
 }
 
-var configFetchConfig func(context.Context, *github.Client, string, string, string, bool, interface{}) error
+var configFetchConfig func(context.Context, *github.Client, string, string, string, config.ConfigLevel, interface{}) error
 
 func init() {
 	configFetchConfig = config.FetchConfig
@@ -81,49 +94,13 @@ func (b Binary) Name() string {
 	return polName
 }
 
-// TODO(log): Replace once scorecard supports a constructor for new loggers.
-//            This is a copy of the `DetailLogger` implementation at:
-//            https://github.com/ossf/scorecard/blob/ba503c3bee014d97c38f3f5caaeb6977935a9272/checker/detail_logger_impl.go
-type logger struct {
-	logs []checker.CheckDetail
-}
-
-func (l *logger) Info(msg *checker.LogMessage) {
-	cd := checker.CheckDetail{
-		Type: checker.DetailInfo,
-		Msg:  *msg,
-	}
-	l.logs = append(l.logs, cd)
-}
-
-func (l *logger) Warn(msg *checker.LogMessage) {
-	cd := checker.CheckDetail{
-		Type: checker.DetailWarn,
-		Msg:  *msg,
-	}
-	l.logs = append(l.logs, cd)
-}
-
-func (l *logger) Debug(msg *checker.LogMessage) {
-	cd := checker.CheckDetail{
-		Type: checker.DetailDebug,
-		Msg:  *msg,
-	}
-	l.logs = append(l.logs, cd)
-}
-
-func (l *logger) Flush() []checker.CheckDetail {
-	ret := l.logs
-	l.logs = nil
-	return ret
-}
-
 // Check performs the policy check for this policy based on the
 // configuration stored in the org/repo, implementing policydef.Policy.Check()
 func (b Binary) Check(ctx context.Context, c *github.Client, owner,
 	repo string) (*policydef.Result, error) {
-	oc, rc := getConfig(ctx, c, owner, repo)
-	enabled, err := config.IsEnabled(ctx, oc.OptConfig, rc.OptConfig, c, owner, repo)
+	oc, orc, rc := getConfig(ctx, c, owner, repo)
+	mc := mergeConfig(oc, orc, rc, repo)
+	enabled, err := config.IsEnabled(ctx, oc.OptConfig, orc.OptConfig, rc.OptConfig, c, owner, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -145,35 +122,31 @@ func (b Binary) Check(ctx context.Context, c *github.Client, owner,
 		}, nil
 	}
 
-	scRepoArg := fmt.Sprintf("%s/%s", owner, repo)
-	scRepo, err := githubrepo.MakeGithubRepo(scRepoArg)
+	fullName := fmt.Sprintf("%s/%s", owner, repo)
+	tr := c.Client().Transport
+	scc, err := scorecard.Get(ctx, fullName, tr)
 	if err != nil {
 		return nil, err
 	}
 
-	roundTripper := c.Client().Transport
-	repoClient := githubrepo.CreateGithubRepoClientWithTransport(ctx, roundTripper)
-	if err := repoClient.InitRepo(scRepo, defaultGitRef); err != nil {
-		return nil, err
-	}
-	defer repoClient.Close()
-	l := logger{}
+	l := checker.NewLogger()
 	cr := &checker.CheckRequest{
 		Ctx:        ctx,
-		RepoClient: repoClient,
-		Repo:       scRepo,
-		Dlogger:    &l,
+		RepoClient: scc.ScRepoClient,
+		Repo:       scc.ScRepo,
+		Dlogger:    l,
 	}
 
-	// TODO, likely this should be a "scorecard" policy that runs multiple checks
-	// here, and uses config to enable/disable checks.
 	res := checks.BinaryArtifacts(cr)
-	if res.Error2 != nil {
-		return nil, res.Error2
+	if res.Error != nil {
+		return nil, res.Error
 	}
 
-	logs := convertLogs(l.logs)
-	pass := res.Score >= checker.MaxResultScore
+	logs := convertAndFilterLogs(l.Flush(), mc)
+
+	// We assume every log is a finding and do filtering on the Allstar side
+	pass := len(logs) == 0
+
 	var notify string
 	if !pass {
 		notify = fmt.Sprintf(`Project is out of compliance with Binary Artifacts policy: %v
@@ -216,9 +189,15 @@ func listJoin(list []string) string {
 	return s
 }
 
-func convertLogs(logs []checker.CheckDetail) []string {
+func convertAndFilterLogs(logs []checker.CheckDetail, mc *mergedConfig) []string {
 	var s []string
 	for _, l := range logs {
+		if in(l.Msg.Path, mc.IgnorePaths) {
+			continue
+		}
+		if in(filepath.Base(l.Msg.Path), mc.IgnoreFiles) {
+			continue
+		}
 		s = append(s, l.Msg.Path)
 	}
 	return s
@@ -238,48 +217,76 @@ func (b Binary) Fix(ctx context.Context, c *github.Client, owner, repo string) e
 // stored in the org-level repo, default log. Implementing
 // policydef.Policy.GetAction()
 func (b Binary) GetAction(ctx context.Context, c *github.Client, owner, repo string) string {
-	oc, rc := getConfig(ctx, c, owner, repo)
-	mc := mergeConfig(oc, rc, repo)
+	oc, orc, rc := getConfig(ctx, c, owner, repo)
+	mc := mergeConfig(oc, orc, rc, repo)
 	return mc.Action
 }
 
-func getConfig(ctx context.Context, c *github.Client, owner, repo string) (*OrgConfig, *RepoConfig) {
+func getConfig(ctx context.Context, c *github.Client, owner, repo string) (*OrgConfig, *RepoConfig, *RepoConfig) {
 	oc := &OrgConfig{ // Fill out non-zero defaults
 		Action: "log",
 	}
-	if err := configFetchConfig(ctx, c, owner, "", configFile, true, oc); err != nil {
+	if err := configFetchConfig(ctx, c, owner, "", configFile, config.OrgLevel, oc); err != nil {
 		log.Error().
 			Str("org", owner).
 			Str("repo", repo).
-			Bool("orgLevel", true).
+			Str("configLevel", "orgLevel").
+			Str("area", polName).
+			Str("file", configFile).
+			Err(err).
+			Msg("Unexpected config error, using defaults.")
+	}
+	orc := &RepoConfig{}
+	if err := configFetchConfig(ctx, c, owner, repo, configFile, config.OrgRepoLevel, orc); err != nil {
+		log.Error().
+			Str("org", owner).
+			Str("repo", repo).
+			Str("configLevel", "orgRepoLevel").
 			Str("area", polName).
 			Str("file", configFile).
 			Err(err).
 			Msg("Unexpected config error, using defaults.")
 	}
 	rc := &RepoConfig{}
-	if err := configFetchConfig(ctx, c, owner, repo, configFile, false, rc); err != nil {
+	if err := configFetchConfig(ctx, c, owner, repo, configFile, config.RepoLevel, rc); err != nil {
 		log.Error().
 			Str("org", owner).
 			Str("repo", repo).
-			Bool("orgLevel", false).
+			Str("configLevel", "repoLevel").
 			Str("area", polName).
 			Str("file", configFile).
 			Err(err).
 			Msg("Unexpected config error, using defaults.")
 	}
-	return oc, rc
+	return oc, orc, rc
 }
 
-func mergeConfig(oc *OrgConfig, rc *RepoConfig, repo string) *mergedConfig {
+func mergeConfig(oc *OrgConfig, orc, rc *RepoConfig, repo string) *mergedConfig {
 	mc := &mergedConfig{
-		Action: oc.Action,
+		Action:      oc.Action,
+		IgnoreFiles: oc.IgnoreFiles,
+		IgnorePaths: rc.IgnorePaths,
 	}
+	mc = mergeInRepoConfig(mc, orc, repo)
 
 	if !oc.OptConfig.DisableRepoOverride {
-		if rc.Action != nil {
-			mc.Action = *rc.Action
-		}
+		mc = mergeInRepoConfig(mc, rc, repo)
 	}
 	return mc
+}
+
+func mergeInRepoConfig(mc *mergedConfig, rc *RepoConfig, repo string) *mergedConfig {
+	if rc.Action != nil {
+		mc.Action = *rc.Action
+	}
+	return mc
+}
+
+func in(s string, l []string) bool {
+	for _, v := range l {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }

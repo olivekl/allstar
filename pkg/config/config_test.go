@@ -17,10 +17,15 @@ package config
 import (
 	"context"
 	"encoding/base64"
+	"errors"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-github/v39/github"
+	"github.com/google/go-github/v43/github"
+	"github.com/ossf/allstar/pkg/config/operator"
+	"sigs.k8s.io/yaml"
 )
 
 var getContents func(context.Context, string, string, string,
@@ -153,7 +158,7 @@ optConfig:
 
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
-			getContents = func(ctx context.Context, owner, repo, path string,
+			walkGC = func(ctx context.Context, r repositories, owner, repo, path string,
 				opts *github.RepositoryContentGetOptions) (*github.RepositoryContent,
 				[]*github.RepositoryContent, *github.Response, error) {
 				e := "base64"
@@ -167,7 +172,7 @@ optConfig:
 				*github.Response, error) {
 				return nil, nil, nil
 			}
-			err := fetchConfig(context.Background(), mockRepos{}, "", "", "", true, test.Got)
+			err := fetchConfig(context.Background(), mockRepos{}, "", "", "", OrgLevel, test.Got)
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
@@ -180,11 +185,13 @@ optConfig:
 
 func TestIsEnabled(t *testing.T) {
 	tests := []struct {
-		Name          string
-		Org           OrgOptConfig
-		Repo          RepoOptConfig
-		IsPrivateRepo bool
-		Expect        bool
+		Name           string
+		Org            OrgOptConfig
+		OrgRepo        RepoOptConfig
+		Repo           RepoOptConfig
+		IsPrivateRepo  bool
+		IsArchivedRepo bool
+		Expect         bool
 	}{
 		{
 			Name: "OptInOrg",
@@ -192,6 +199,7 @@ func TestIsEnabled(t *testing.T) {
 				OptOutStrategy: false,
 				OptInRepos:     []string{"thisrepo"},
 			},
+			OrgRepo:       RepoOptConfig{},
 			Repo:          RepoOptConfig{},
 			IsPrivateRepo: false,
 			Expect:        true,
@@ -202,6 +210,7 @@ func TestIsEnabled(t *testing.T) {
 				OptOutStrategy: false,
 				OptInRepos:     []string{"otherrepo"},
 			},
+			OrgRepo:       RepoOptConfig{},
 			Repo:          RepoOptConfig{},
 			IsPrivateRepo: false,
 			Expect:        false,
@@ -211,6 +220,7 @@ func TestIsEnabled(t *testing.T) {
 			Org: OrgOptConfig{
 				OptOutStrategy: true,
 			},
+			OrgRepo:       RepoOptConfig{},
 			Repo:          RepoOptConfig{},
 			IsPrivateRepo: false,
 			Expect:        true,
@@ -221,6 +231,7 @@ func TestIsEnabled(t *testing.T) {
 				OptOutStrategy: true,
 				OptOutRepos:    []string{"thisrepo"},
 			},
+			OrgRepo:       RepoOptConfig{},
 			Repo:          RepoOptConfig{},
 			IsPrivateRepo: false,
 			Expect:        false,
@@ -231,6 +242,7 @@ func TestIsEnabled(t *testing.T) {
 				OptOutStrategy:     true,
 				OptOutPrivateRepos: true,
 			},
+			OrgRepo:       RepoOptConfig{},
 			Repo:          RepoOptConfig{},
 			IsPrivateRepo: true,
 			Expect:        false,
@@ -241,6 +253,7 @@ func TestIsEnabled(t *testing.T) {
 				OptOutStrategy:     true,
 				OptOutPrivateRepos: false,
 			},
+			OrgRepo:       RepoOptConfig{},
 			Repo:          RepoOptConfig{},
 			IsPrivateRepo: true,
 			Expect:        true,
@@ -251,6 +264,7 @@ func TestIsEnabled(t *testing.T) {
 				OptOutStrategy:    true,
 				OptOutPublicRepos: true,
 			},
+			OrgRepo:       RepoOptConfig{},
 			Repo:          RepoOptConfig{},
 			IsPrivateRepo: false,
 			Expect:        false,
@@ -261,13 +275,38 @@ func TestIsEnabled(t *testing.T) {
 				OptOutStrategy:    true,
 				OptOutPublicRepos: false,
 			},
+			OrgRepo:       RepoOptConfig{},
 			Repo:          RepoOptConfig{},
 			IsPrivateRepo: false,
 			Expect:        true,
 		},
 		{
-			Name: "RepoOptIn",
-			Org:  OrgOptConfig{},
+			Name: "OptOutArchivedRepos",
+			Org: OrgOptConfig{
+				OptOutStrategy:      true,
+				OptOutArchivedRepos: true,
+			},
+			OrgRepo:        RepoOptConfig{},
+			Repo:           RepoOptConfig{},
+			IsPrivateRepo:  true,
+			IsArchivedRepo: true,
+			Expect:         false,
+		},
+		{
+			Name: "NoOptOutArchivedRepos",
+			Org: OrgOptConfig{
+				OptOutStrategy: true,
+			},
+			OrgRepo:        RepoOptConfig{},
+			Repo:           RepoOptConfig{},
+			IsPrivateRepo:  true,
+			IsArchivedRepo: true,
+			Expect:         true,
+		},
+		{
+			Name:    "RepoOptIn",
+			Org:     OrgOptConfig{},
+			OrgRepo: RepoOptConfig{},
 			Repo: RepoOptConfig{
 				OptIn: true,
 			},
@@ -279,6 +318,7 @@ func TestIsEnabled(t *testing.T) {
 			Org: OrgOptConfig{
 				OptOutStrategy: true,
 			},
+			OrgRepo: RepoOptConfig{},
 			Repo: RepoOptConfig{
 				OptOut: true,
 			},
@@ -291,11 +331,63 @@ func TestIsEnabled(t *testing.T) {
 				OptOutStrategy:      true,
 				DisableRepoOverride: true,
 			},
+			OrgRepo: RepoOptConfig{},
 			Repo: RepoOptConfig{
 				OptOut: true,
 			},
 			IsPrivateRepo: false,
 			Expect:        true,
+		},
+		{
+			Name: "OrgRepoOptIn",
+			Org:  OrgOptConfig{},
+			OrgRepo: RepoOptConfig{
+				OptIn: true,
+			},
+			Repo:          RepoOptConfig{},
+			IsPrivateRepo: false,
+			Expect:        true,
+		},
+		{
+			Name: "OrgRepoOptOut",
+			Org: OrgOptConfig{
+				OptOutStrategy: true,
+			},
+			OrgRepo: RepoOptConfig{
+				OptOut: true,
+			},
+			Repo:          RepoOptConfig{},
+			IsPrivateRepo: false,
+			Expect:        false,
+		},
+		{
+			Name: "OrgRepoOptOutRepoOptIn",
+			Org: OrgOptConfig{
+				OptOutStrategy: true,
+			},
+			OrgRepo: RepoOptConfig{
+				OptOut: false,
+			},
+			Repo: RepoOptConfig{
+				OptOut: true,
+			},
+			IsPrivateRepo: false,
+			Expect:        false,
+		},
+		{
+			Name: "DissallowWithOrgRepo",
+			Org: OrgOptConfig{
+				OptOutStrategy:      true,
+				DisableRepoOverride: true,
+			},
+			OrgRepo: RepoOptConfig{
+				OptOut: true,
+			},
+			Repo: RepoOptConfig{
+				OptOut: true,
+			},
+			IsPrivateRepo: false,
+			Expect:        false,
 		},
 	}
 	for _, test := range tests {
@@ -303,10 +395,11 @@ func TestIsEnabled(t *testing.T) {
 			get = func(context.Context, string, string) (*github.Repository,
 				*github.Response, error) {
 				return &github.Repository{
-					Private: &test.IsPrivateRepo,
+					Private:  &test.IsPrivateRepo,
+					Archived: &test.IsArchivedRepo,
 				}, nil, nil
 			}
-			got, _ := isEnabled(context.Background(), test.Org, test.Repo, mockRepos{}, "thisorg", "thisrepo")
+			got, _ := isEnabled(context.Background(), test.Org, test.OrgRepo, test.Repo, mockRepos{}, "thisorg", "thisrepo")
 			if got != test.Expect {
 				t.Errorf("Unexpected results on %v. Expected: %v", test.Name, test.Expect)
 			}
@@ -328,7 +421,7 @@ optConfig:
 optConfig:
   optOut: true
 `
-	getContents = func(ctx context.Context, owner, repo, path string,
+	walkGC = func(ctx context.Context, r repositories, owner, repo, path string,
 		opts *github.RepositoryContentGetOptions) (*github.RepositoryContent,
 		[]*github.RepositoryContent, *github.Response, error) {
 		e := "base64"
@@ -346,5 +439,274 @@ optConfig:
 
 	if !isBotEnabled(context.Background(), mockRepos{}, "", "thisrepo") {
 		t.Error("Expected repo to be enabled")
+	}
+}
+
+func TestCreateIL(t *testing.T) {
+	tests := []struct {
+		Name       string
+		DotAllstar bool
+		DotGithub  bool
+		Expect     *instLoc
+	}{
+		{
+			Name:       "Allstar exists",
+			DotAllstar: true,
+			DotGithub:  true,
+			Expect: &instLoc{
+				Exists: true,
+				Repo:   operator.OrgConfigRepo,
+				Path:   "",
+			},
+		},
+		{
+			Name:       "Allstar exists2",
+			DotAllstar: true,
+			DotGithub:  false,
+			Expect: &instLoc{
+				Exists: true,
+				Repo:   operator.OrgConfigRepo,
+				Path:   "",
+			},
+		},
+		{
+			Name:       "Dot Github",
+			DotAllstar: false,
+			DotGithub:  true,
+			Expect: &instLoc{
+				Exists: true,
+				Repo:   githubConfRepo,
+				Path:   operator.OrgConfigDir,
+			},
+		},
+		{
+			Name:       "Neither",
+			DotAllstar: false,
+			DotGithub:  false,
+			Expect: &instLoc{
+				Exists: false,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			get = func(ctx context.Context, owner, repo string) (*github.Repository,
+				*github.Response, error) {
+				if repo == operator.OrgConfigRepo && test.DotAllstar {
+					return nil, nil, nil
+				}
+				if repo == githubConfRepo && test.DotGithub {
+					return nil, nil, nil
+				}
+				return nil, &github.Response{Response: &http.Response{StatusCode: http.StatusNotFound}}, errors.New("Not found")
+			}
+			got, err := createIl(context.Background(), mockRepos{}, "")
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(test.Expect, got); diff != "" {
+				t.Errorf("Unexpected results. (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGetIL(t *testing.T) {
+	var getCalled bool
+	get = func(ctx context.Context, owner, repo string) (*github.Repository,
+		*github.Response, error) {
+		getCalled = true
+		return nil, nil, nil
+	}
+	getCalled = false
+	if _, err := getInstLoc(context.Background(), mockRepos{}, "foo"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !getCalled {
+		t.Errorf("Get not called")
+	}
+	getCalled = false
+	if _, err := getInstLoc(context.Background(), mockRepos{}, "foo"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if getCalled {
+		t.Errorf("Get called on second lookup")
+	}
+	ClearInstLoc("foo")
+	getCalled = false
+	if _, err := getInstLoc(context.Background(), mockRepos{}, "foo"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !getCalled {
+		t.Errorf("Get not called after clear")
+	}
+	getCalled = false
+	if _, err := getInstLoc(context.Background(), mockRepos{}, "bar"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !getCalled {
+		t.Errorf("Get not called on second org")
+	}
+}
+
+func TestWalkGetContents(t *testing.T) {
+	p := "long/path/file.yaml"
+	expect := []string{"", "long/", "long/path/", "long/path/file.yaml"}
+	var got []string
+	getContents = func(ctx context.Context, owner, repo, pt string,
+		opts *github.RepositoryContentGetOptions) (*github.RepositoryContent,
+		[]*github.RepositoryContent, *github.Response, error) {
+		got = append(got, pt)
+		if strings.HasSuffix(pt, ".yaml") {
+			e := "base64"
+			c := base64.StdEncoding.EncodeToString([]byte("asdf"))
+			return &github.RepositoryContent{
+				Encoding: &e,
+				Content:  &c,
+			}, nil, nil, nil
+		} else {
+			return nil, []*github.RepositoryContent{ // All three are always there
+				&github.RepositoryContent{Name: github.String("long")},
+				&github.RepositoryContent{Name: github.String("path")},
+				&github.RepositoryContent{Name: github.String("file.yaml")},
+			}, nil, nil
+		}
+	}
+	_, _, _, _ = walkGetContents(context.Background(), mockRepos{}, "", "", p, nil)
+	if diff := cmp.Diff(expect, got); diff != "" {
+		t.Errorf("Unexpected results. (-want +got):\n%s", diff)
+	}
+
+	expect2 := []string{"", "long/"}
+	var got2 []string
+	getContents = func(ctx context.Context, owner, repo, pt string,
+		opts *github.RepositoryContentGetOptions) (*github.RepositoryContent,
+		[]*github.RepositoryContent, *github.Response, error) {
+		got2 = append(got2, pt)
+		if strings.HasSuffix(pt, ".yaml") {
+			e := "base64"
+			c := base64.StdEncoding.EncodeToString([]byte("asdf"))
+			return &github.RepositoryContent{
+				Encoding: &e,
+				Content:  &c,
+			}, nil, nil, nil
+		} else {
+			return nil, []*github.RepositoryContent{ // path is not there
+				&github.RepositoryContent{Name: github.String("long")},
+				&github.RepositoryContent{Name: github.String("file.yaml")},
+			}, nil, nil
+		}
+	}
+	_, _, rsp, _ := walkGetContents(context.Background(), mockRepos{}, "", "", p, nil)
+	if diff := cmp.Diff(expect2, got2); diff != "" {
+		t.Errorf("Unexpected results. (-want +got):\n%s", diff)
+	}
+	if rsp == nil || rsp.StatusCode != http.StatusNotFound {
+		t.Errorf("Expected status not found, got: %v", rsp)
+	}
+}
+
+func TestMerge(t *testing.T) {
+	tests := []struct {
+		Name   string
+		Input  string
+		Base   string
+		Expect string
+	}{
+		{
+			Name: "NoMerge",
+			Input: `
+foo: asdf
+barBaz: qwer
+`,
+			Base: "",
+			Expect: `barBaz: qwer
+foo: asdf
+`,
+		},
+		{
+			Name: "MergeNoChange",
+			Input: `
+baseConfig: poiu/lkjh
+`,
+			Base: `
+foo: asdf
+barBaz: qwer
+`,
+			Expect: `barBaz: qwer
+baseConfig: poiu/lkjh
+foo: asdf
+`,
+		},
+		{
+			Name: "MergeNoBase",
+			Input: `
+baseConfig: poiu/lkjh
+foo: asdf
+`,
+			Base: "",
+			Expect: `baseConfig: poiu/lkjh
+foo: asdf
+`,
+		},
+		{
+			Name: "MergeAdd",
+			Input: `
+baseConfig: poiu/lkjh
+foo: asdf
+`,
+			Base: `
+barBaz: qwer
+`,
+			Expect: `barBaz: qwer
+baseConfig: poiu/lkjh
+foo: asdf
+`,
+		},
+		{
+			Name: "MergeOverride",
+			Input: `
+baseConfig: poiu/lkjh
+foo: asdf
+`,
+			Base: `
+foo: foo
+barBaz: qwer
+`,
+			Expect: `barBaz: qwer
+baseConfig: poiu/lkjh
+foo: asdf
+`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			getContents = func(ctx context.Context, owner, repo, path string,
+				opts *github.RepositoryContentGetOptions) (*github.RepositoryContent,
+				[]*github.RepositoryContent, *github.Response, error) {
+				// check owner / repo / path??
+				e := "base64"
+				c := base64.StdEncoding.EncodeToString([]byte(test.Base))
+				return &github.RepositoryContent{
+					Encoding: &e,
+					Content:  &c,
+				}, nil, nil, nil
+			}
+			conJSON, err := yaml.YAMLToJSON([]byte(test.Input))
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			got, err := checkAndMergeBase(context.Background(), mockRepos{}, "path", conJSON)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			gotYAML, err := yaml.JSONToYAML(got)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(test.Expect, string(gotYAML)); diff != "" {
+				t.Errorf("Unexpected results. (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

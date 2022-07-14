@@ -21,10 +21,12 @@ import (
 	"net/http"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
-	"github.com/google/go-github/v39/github"
+	"github.com/google/go-github/v43/github"
 	"github.com/gregjones/httpcache"
 	"github.com/ossf/allstar/pkg/config/operator"
 	"gocloud.dev/runtimevar"
+	_ "gocloud.dev/runtimevar/awssecretsmanager"
+	_ "gocloud.dev/runtimevar/filevar"
 	_ "gocloud.dev/runtimevar/gcpsecretmanager"
 )
 
@@ -33,11 +35,21 @@ var ghinstallationNewAppsTransport func(http.RoundTripper, int64,
 var ghinstallationNew func(http.RoundTripper, int64, int64, []byte) (
 	*ghinstallation.Transport, error)
 var getKey func(context.Context) ([]byte, error)
+var getKeyFromSecret func(context.Context, string) ([]byte, error)
+
+var privateKey = operator.PrivateKey
+var keySecret = operator.KeySecret
 
 func init() {
 	ghinstallationNewAppsTransport = ghinstallation.NewAppsTransport
 	ghinstallationNew = ghinstallation.New
 	getKey = getKeyReal
+	getKeyFromSecret = getKeyFromSecretReal
+}
+
+type GhClientsInterface interface {
+	Get(i int64) (*github.Client, error)
+	LogCacheSize()
 }
 
 // GHClients stores clients per-installation for re-use througout a process.
@@ -70,22 +82,24 @@ func (g *GHClients) Get(i int64) (*github.Client, error) {
 	if c, ok := g.clients[i]; ok {
 		return c, nil
 	}
+
+	ctr := &httpcache.Transport{
+		Transport:           g.tr,
+		Cache:               g.cache,
+		MarkCachedResponses: true,
+	}
+
 	var tr http.RoundTripper
 	var err error
 	if i == 0 {
-		tr, err = ghinstallationNewAppsTransport(g.tr, operator.AppID, g.key)
+		tr, err = ghinstallationNewAppsTransport(ctr, operator.AppID, g.key)
 	} else {
-		tr, err = ghinstallationNew(g.tr, operator.AppID, i, g.key)
+		tr, err = ghinstallationNew(ctr, operator.AppID, i, g.key)
 	}
 	if err != nil {
 		return nil, err
 	}
-	ctr := &httpcache.Transport{
-		Transport:           tr,
-		Cache:               g.cache,
-		MarkCachedResponses: true,
-	}
-	g.clients[i] = github.NewClient(&http.Client{Transport: ctr})
+	g.clients[i] = github.NewClient(&http.Client{Transport: tr})
 	return g.clients[i], nil
 }
 
@@ -93,8 +107,8 @@ func (g *GHClients) LogCacheSize() {
 	g.cache.LogCacheSize()
 }
 
-func getKeyReal(ctx context.Context) ([]byte, error) {
-	v, err := runtimevar.OpenVariable(ctx, operator.KeySecret)
+func getKeyFromSecretReal(ctx context.Context, keySecretVal string) ([]byte, error) {
+	v, err := runtimevar.OpenVariable(ctx, keySecretVal)
 	if err != nil {
 		return nil, err
 	}
@@ -104,4 +118,11 @@ func getKeyReal(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	return s.Value.([]byte), nil
+}
+
+func getKeyReal(ctx context.Context) ([]byte, error) {
+	if keySecret == "direct" {
+		return []byte(privateKey), nil
+	}
+	return getKeyFromSecret(ctx, keySecret)
 }
