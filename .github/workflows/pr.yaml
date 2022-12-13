@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
     - uses: actions/checkout@629c2de402a417ea7690ca6ce3f33229e27606a5 # v2
-    - uses: actions/setup-go@b22fbbc2921299758641fab08929b4ac52b32923 # v2
+    - uses: actions/setup-go@6edd4406fa81c3da01a34fa6f6343087c207a568 # v2
       with:
         go-version: '1.16.5'
     - run: go build -v ./...
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
     - uses: actions/checkout@629c2de402a417ea7690ca6ce3f33229e27606a5 # v2
-    - uses: actions/setup-go@b22fbbc2921299758641fab08929b4ac52b32923 # v2
+    - uses: actions/setup-go@6edd4406fa81c3da01a34fa6f6343087c207a568 # v2
       with:
         go-version: '1.16.5'
     - run: go test -v ./...
